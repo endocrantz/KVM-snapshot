@@ -1,0 +1,103 @@
+#!/bin/bash
+
+# Get a list of running VMs, create a snapshot, and delete the oldest >2
+
+if [[ $1 == "-h" ]] ; then
+    echo
+    echo "`basename $0` [domain] [-h]"
+    echo "   Provide one domain name to snap or"
+    echo "   no arguments to snap all VM domains."
+    echo
+    exit 0
+fi
+
+BackupDir=/gpfs1/cluster/vm-images/backups
+SnapDir=/var/lib/libvirt/images
+BackupLog=/gpfs1/cluster/vm-images/backups/vmsnaps.log
+
+for Dom in `[[ ${1} ]] && echo ${1} || /bin/virsh list | /bin/tail -n +3 \
+    | /bin/awk {'print $2'}` ; do
+
+    Now=`/bin/date +%Y%m%d.%H%M%S`
+    echo "Beginning backup for ${Dom} on" $HOSTNAME \
+        `/bin/date '+%F.%H:%M:%S'` >> ${BackupLog}
+
+    # Get the VM disk image path
+    vmImage=`/bin/virsh domblklist ${Dom} \
+        | /bin/awk -v dom="${Dom}" '$0 ~ dom {print $2}'`
+
+    # Create the xml to load the snapshot anywhere
+    /bin/virsh dumpxml ${Dom} > ${BackupDir}/${Dom}.xml.${Now}
+
+    # Create the temp image in the local snap dir
+    /bin/virsh snapshot-create-as --domain ${Dom} \
+        --diskspec vda,file=${SnapDir}/${Dom}.snap.qcow2 \
+        --no-metadata --quiesce --disk-only --atomic >/dev/null
+    [[ $? -ne 0 ]] && { \
+        echo "Snap creation failure for domain ${Dom}" 1>&2 ; \
+        echo "Terminated on error for" $Dom >> ${BackupLog} ; exit 1 ; }
+
+    # Get the new image name for testing
+    snapImage=`/bin/virsh domblklist ${Dom} \
+        | /bin/awk -v dom="${Dom}" '$0 ~ dom {print $2}'`
+
+    # Validate the domain block device is the not original image
+    [[ ${SnapDir}/${Dom}.snap.qcow2 != ${snapImage} ]] && { \
+        echo "Snap failed, image is ${snapImage} for domain ${Dom}" ; \
+        echo "Terminated on error for" $Dom >> ${BackupLog} ; exit 1 ; }
+
+    # Copy the full image to backup dir
+    /bin/cp --sparse=always ${vmImage} ${BackupDir}/${Dom}.qcow2.${Now}
+    [[ $? -ne 0 ]] && { \
+        echo "Failed to copy the image to backup for domain ${Dom}" 1>&2 ; \
+        echo "Terminated on error for" $Dom >> ${BackupLog} ; exit 1 ; }
+
+    # Merge the image back to where it belongs
+    /bin/virsh blockcommit ${Dom} vda \
+        --shallow --active --wait --pivot >/dev/null
+    [[ $? -ne 0 ]] && { echo "${Dom} blockcommit pivot failure" ; \
+        echo "Domain may be improperly configured" ; \
+        echo "Terminated on error for" $Dom >> ${BackupLog} ; exit 1 ; }
+
+    # Get the image name now, for testing
+    pivotImage=`/bin/virsh domblklist ${Dom} \
+        | /bin/awk -v dom="${Dom}" '$0 ~ dom {print $2}'`
+
+    # Validate the domain block device is back to the original image
+    [[ $vmImage != $pivotImage ]] && { \
+        echo "Pivot blockcommit failed image for domain ${Dom}" ; \
+        echo "The current image is ${pivotImage}, should be ${vmImage}" ; \
+        echo "Domain may be improperly configured" ; \
+        echo "Terminated on error for" $Dom >> ${BackupLog} ; exit 1 ; }
+
+    # Delete the older snapshot if more than two exist
+    numsnaps=`/bin/ls -t ${BackupDir}/${Dom}.qcow2.* | /bin/wc -l`
+    if [ $numsnaps -gt 2 ] ; then
+        /bin/ls -t ${BackupDir}/${Dom}.qcow2.* \
+            | /bin/tail -n+3 | /bin/xargs /bin/rm -f
+        [[ $? -ne 0 ]] && { \
+            echo "Failed to delete old snapshot(s) for domain ${Dom}" ; \
+            echo "Terminated on error for" $Dom >> ${BackupLog} ; exit 1 ; }
+        numxmls=`/bin/ls -t ${BackupDir}/${Dom}.xml.* | /bin/wc -l`
+        if [ $numxmls -gt 2 ] ; then
+            /bin/ls -t ${BackupDir}/${Dom}.xml.* \
+                | /bin/tail -n+3 | /bin/xargs /bin/rm -f
+            [[ $? -ne 0 ]] && { \
+                echo "Failed to remove old xml(s) for domain ${Dom}" ; \
+                echo "Terminated on error for" $Dom >> ${BackupLog} ; \
+                exit 1 ; }
+        fi
+    fi
+
+    # Remove the abandoned snap image, finally
+    /bin/rm -f ${SnapDir}/${Dom}.snap.qcow2
+    [[ $? -ne 0 ]] && { \
+        echo "Failed to remove the old snap image for domain ${Dom}" ; \
+        echo "Terminated on error for" $Dom >> ${BackupLog} ; exit 1 ; }
+
+    echo "Finished snapshot for ${Dom} on" \
+        `/bin/date '+%F.%H:%M:%S'` >> ${BackupLog}
+
+done
+echo "Completed VM snapshots on" $HOSTNAME >> ${BackupLog}
+echo >> ${BackupLog}
